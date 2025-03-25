@@ -5,6 +5,8 @@ import numpy as np
 from PIL import Image, ImageGrab, ImageTk
 import threading
 import time
+import win32gui
+import win32con
 
 class ImageProcessingApp:
     def __init__(self, root):
@@ -17,20 +19,23 @@ class ImageProcessingApp:
         self.template = None
         self.interval = tk.IntVar(value=100)
         self.log_counter = 0
+        self.target_hwnd = None
+        self.capture_region = (580, 598, 126, 92)  # 窗口客户区截图区域
         
         # 创建界面布局
         self.create_widgets()
         
-        # 初始化OpenCV参数
-        self.screen_region = (633,645, 140, 94)  # 截图区域
-        
+        # 初始化窗口绑定
+        self.bind_game_window()
+        self.bg_color = (255, 255, 255)  # 白色背景
+
     def create_widgets(self):
         # 主容器
-        main_frame = ttk.Frame(self.root, width=700, height=400)
+        main_frame = ttk.Frame(self.root, width=710, height=510)
         main_frame.pack(fill=tk.BOTH, expand=True)
         
         # 图像显示区域
-        self.canvas = tk.Canvas(main_frame, width=500, height=400, bg='#2E2E2E')
+        self.canvas = tk.Canvas(main_frame, width=500, height=400, bg='#fff')
         self.canvas.pack(side=tk.LEFT)
         
         # 控制面板
@@ -53,33 +58,86 @@ class ImageProcessingApp:
         self.log_text.tag_config('info', foreground='blue')
         self.log_text.tag_config('success', foreground='green')
         self.log_text.tag_config('error', foreground='red')
+
+    def bind_game_window(self):
+        """绑定到龙之谷怀旧服窗口"""
+        self.target_hwnd = win32gui.FindWindow(None, "龙之谷怀旧服")
+        if not self.target_hwnd:
+            self.log("未找到游戏窗口，请先启动游戏！", 'error')
+            return False
         
+        self.log("已绑定游戏窗口", 'success')
+        return True
+
+    def get_window_snapshot(self):
+        """获取窗口客户区指定区域的截图"""
+        if not self.target_hwnd or not win32gui.IsWindowVisible(self.target_hwnd):
+            if not self.bind_game_window():
+                return None
+            
+        try:
+            # 获取窗口客户区坐标
+            client_rect = win32gui.GetClientRect(self.target_hwnd)
+            client_left, client_top, client_right, client_bottom = client_rect
+            
+            # 转换为屏幕坐标
+            (abs_left, abs_top) = win32gui.ClientToScreen(self.target_hwnd, (client_left, client_top))
+            (abs_right, abs_bottom) = win32gui.ClientToScreen(self.target_hwnd, (client_right, client_bottom))
+            
+            # 计算目标区域
+            x, y, w, h = self.capture_region
+            region = (
+                abs_left + x,
+                abs_top + y,
+                abs_left + x + w,
+                abs_top + y + h
+            )
+            
+            # 截取屏幕区域
+            return ImageGrab.grab(bbox=region)
+        except Exception as e:
+            self.log(f"截图失败: {str(e)}", 'error')
+            return None
+
     def initialize(self):
         """初始化画布并截取基准图"""
         try:
             # 创建500x400画布
-            canvas = np.zeros((400, 500, 3), dtype=np.uint8)
+            canvas = np.full((400, 500, 3), self.bg_color, dtype=np.uint8)
             
-            # 截取屏幕区域
-            screen_img = ImageGrab.grab(bbox=(
-                self.screen_region[0],
-                self.screen_region[1],
-                self.screen_region[0] + self.screen_region[2],
-                self.screen_region[1] + self.screen_region[3]
-            ))
+            # 获取窗口截图
+            screen_img = self.get_window_snapshot()
+            if screen_img is None:
+                return
+                
             screen_cv = cv2.cvtColor(np.array(screen_img), cv2.COLOR_RGB2BGR)
             
-            # 居中放置
+            # 获取截图尺寸
             h, w = screen_cv.shape[:2]
-            x = (500 - w) // 2
-            y = (400 - h) // 2
-            canvas[y:y+h, x:x+w] = screen_cv
+            
+            # 计算精确中心坐标
+            x_center = 250  # 画布中心X
+            y_center = 200  # 画布中心Y
+            x_start = x_center - w // 2
+            y_start = y_center - h // 2
+            
+            # 边界保护
+            x_start = max(0, x_start)
+            y_start = max(0, y_start)
+            x_end = min(500, x_start + w)
+            y_end = min(400, y_start + h)
+            
+            # 调整有效区域
+            canvas[y_start:y_end, x_start:x_end] = screen_cv[
+                0:(y_end - y_start), 
+                0:(x_end - x_start)
+            ]
             
             # 保存并显示
             self.current_big_image = canvas
             cv2.imwrite('base_image.bmp', canvas)
             self.update_canvas()
-            self.log("初始化成功", 'success')
+            self.log(f"基准图已中心放置 (X:{x_start}-{x_end} Y:{y_start}-{y_end})", 'success')
         except Exception as e:
             self.log(f"初始化失败: {str(e)}", 'error')
             
@@ -111,18 +169,19 @@ class ImageProcessingApp:
             start_time = time.time()
             
             try:
-                # 截取模板图
-                screen_img = ImageGrab.grab(bbox=(
-                    self.screen_region[0],
-                    self.screen_region[1],
-                    self.screen_region[0] + self.screen_region[2],
-                    self.screen_region[1] + self.screen_region[3]
-                ))
-                self.template = cv2.cvtColor(np.array(screen_img), cv2.COLOR_RGB2BGR)
+                # 截取完整模板图
+                screen_img = self.get_window_snapshot()
+                if screen_img is None:
+                    continue
+                    
+                full_template = cv2.cvtColor(np.array(screen_img), cv2.COLOR_RGB2BGR)
+                
+                # 截取ROI区域（模板图中的9,7,48,41区域）
+                roi_in_template = full_template[7:48, 9:57]  # y从7到48，x从9到57
                 
                 # 执行匹配和合并
-                self.match_and_merge()
-                self.update_canvas()
+                if self.match_and_merge(full_template, roi_in_template):
+                    self.update_canvas()
                 
             except Exception as e:
                 self.log(f"处理错误: {str(e)}", 'error')
@@ -131,48 +190,61 @@ class ImageProcessingApp:
             elapsed = (time.time() - start_time) * 1000
             sleep_time = max(0, self.interval.get() - elapsed)
             time.sleep(sleep_time / 1000)
-            
-    def match_and_merge(self):
-        """执行模板匹配和图像合并"""
-        # 裁剪模板（保持原逻辑）
-        cropped = self.template[5:-5, 5:-5]
+
+    def match_and_merge(self, full_template, roi_template):
+        """执行模板匹配和完整模板合并"""
+        # 参数说明：
+        # full_template: 完整模板图（需要合并的部分）
+        # roi_template: 用于匹配的ROI区域
         
-        # 模板匹配
-        result = cv2.matchTemplate(self.current_big_image, cropped, cv2.TM_CCOEFF_NORMED)
+        # 执行模板匹配
+        result = cv2.matchTemplate(self.current_big_image, roi_template, cv2.TM_CCOEFF_NORMED)
         _, max_val, _, max_loc = cv2.minMaxLoc(result)
         
-        # 新增置信度检查
-        if max_val < 0.5:
-            self.log(f"低匹配置信度 {max_val:.2f}，跳过合并", 'error')
-            return
+        # 置信度检查（根据ROI尺寸调整）
+        if max_val < 0.7:
+            self.log(f"匹配失败 {max_val:.2f} < 0.7", 'error')
+            return False
         
-        # 计算原始模板应放置的坐标（关键修复）
-        original_x = max_loc[0] - 5  # 补偿左裁剪
-        original_y = max_loc[1] - 5  # 补偿上裁剪
+        # 计算完整模板的放置位置（关键逻辑）
+        # ROI在模板图中的位置偏移量（9,7）
+        roi_offset_x = 9  # ROI在模板图中的x起点
+        roi_offset_y = 7  # ROI在模板图中的y起点
         
-        # 合并图像（带边界保护）
-        merged = self.current_big_image.copy()
-        h, w = self.template.shape[:2]
+        # 计算完整模板应放置的位置
+        template_h, template_w = full_template.shape[:2]
+        target_x = max_loc[0] - roi_offset_x  # 大图上的x坐标
+        target_y = max_loc[1] - roi_offset_y  # 大图上的y坐标
         
-        # 计算有效区域
-        x1 = max(original_x, 0)
-        y1 = max(original_y, 0)
-        x2 = min(original_x + w, merged.shape[1])
-        y2 = min(original_y + h, merged.shape[0])
+        # 边界保护计算
+        # 有效目标区域（在大图中）
+        x1 = max(target_x, 0)
+        y1 = max(target_y, 0)
+        x2 = min(target_x + template_w, self.current_big_image.shape[1])
+        y2 = min(target_y + template_h, self.current_big_image.shape[0])
         
-        # 计算模板有效区域
-        tx = 0 if original_x >=0 else abs(original_x)
-        ty = 0 if original_y >=0 else abs(original_y)
-        tw = x2 - x1
-        th = y2 - y1
+        # 对应的模板区域
+        temp_x = max(0 - target_x, 0)
+        temp_y = max(0 - target_y, 0)
+        temp_w = x2 - x1
+        temp_h = y2 - y1
         
-        # 执行安全合并
-        if tw > 0 and th > 0:
-            merged[y1:y2, x1:x2] = self.template[ty:ty+th, tx:tx+tw]
-            self.current_big_image = merged
-            self.log(f"成功合并 (X:{x1}-{x2} Y:{y1}-{y2})", 'success')
-        else:
+        if temp_w <= 0 or temp_h <= 0:
             self.log("无效合并区域，跳过", 'error')
+            return False
+        
+        # 执行图像合并
+        try:
+            # 获取模板的有效区域
+            template_region = full_template[temp_y:temp_y+temp_h, temp_x:temp_x+temp_w]
+            
+            # 合并到当前大图
+            self.current_big_image[y1:y2, x1:x2] = template_region
+            self.log(f"成功合并完整模板 (X:{x1}-{x2} Y:{y1}-{y2})", 'success')
+            return True
+        except Exception as e:
+            self.log(f"合并失败: {str(e)}", 'error')
+            return False
         
     def update_canvas(self):
         """更新画布显示"""
